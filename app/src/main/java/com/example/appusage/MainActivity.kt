@@ -30,6 +30,7 @@ import androidx.compose.ui.unit.dp
 import com.example.appusage.ui.theme.AppUsageTheme
 import java.text.SimpleDateFormat
 import java.util.Date
+import java.util.LinkedList
 import java.util.Locale
 
 class AppUsageTracker(private val context: Context) {
@@ -38,20 +39,13 @@ class AppUsageTracker(private val context: Context) {
     private val minimumTimeThreshold = 1000
 
 
-    data class AppSession(
-        val packageName: String,
-        val appName: String,
-        val startTime: Long,
-        var endTime: Long = 0,
-        var duration: Long = 0
-    )
-
+    private val sessionStorage= LinkedList<AppSession>()
     private val activeSessions = mutableMapOf<String, AppSession>()
 
     fun trackCurrentApp() {
         val usageStatsManager = context.getSystemService(Context.USAGE_STATS_SERVICE) as UsageStatsManager
         val endTime = System.currentTimeMillis()
-        val startTime = endTime - 1000 * 60
+        val startTime = endTime - 1000
 
         val events = usageStatsManager.queryEvents(startTime, endTime)
         val event = UsageEvents.Event()
@@ -79,6 +73,7 @@ class AppUsageTracker(private val context: Context) {
                     packageName
                 }
 
+                val timeFormat = SimpleDateFormat("HH:mm:ss", Locale.getDefault())
                 when (event.eventType) {
                     UsageEvents.Event.MOVE_TO_FOREGROUND -> {
 
@@ -87,10 +82,10 @@ class AppUsageTracker(private val context: Context) {
                             appName = appName,
                             startTime = currentTime
                         )
-
-                        val timeStr = SimpleDateFormat("HH:mm:ss", Locale.getDefault())
-                            .format(Date(currentTime))
-                        Log.i("AppUsageTracker", "App Opened: $appName | Time: $timeStr")
+                        val timeOpen = timeFormat.format(Date(currentTime))
+                        Log.i("AppUsageTracker",
+                            "App Name: $packageName | " +
+                                    "Open: $timeOpen | ")
                     }
 
                     UsageEvents.Event.MOVE_TO_BACKGROUND -> {
@@ -99,15 +94,15 @@ class AppUsageTracker(private val context: Context) {
                             session.endTime = currentTime
                             session.duration = currentTime - session.startTime
 
-                            val timeStr = SimpleDateFormat("HH:mm:ss", Locale.getDefault())
-                                .format(Date(currentTime))
+                            val timeClose = timeFormat.format(Date(currentTime))
                             val durationSeconds = session.duration / 1000
 
                             Log.i("AppUsageTracker",
-                                "App Closed: ${session.appName} | " +
-                                        "Time: $timeStr | " +
+                                "App Name: ${session.appName} | " +
+                                        "close: $timeClose | " +
                                         "Duration: $durationSeconds seconds")
 
+                            sessionStorage.add(session)
                             activeSessions.remove(packageName)
                         }
                     }
