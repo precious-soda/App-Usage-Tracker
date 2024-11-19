@@ -4,9 +4,10 @@ import android.app.usage.UsageEvents
 import android.app.usage.UsageStatsManager
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ApplicationInfo
+import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
-import android.os.Handler
-import android.os.Looper
 import android.provider.Settings
 import android.util.Log
 import androidx.activity.ComponentActivity
@@ -27,11 +28,17 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
+import androidx.core.app.NotificationManagerCompat
 import com.example.appusage.ui.theme.AppUsageTheme
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.LinkedList
 import java.util.Locale
+
+object PreferencesConstants {
+    const val PREF_NAME = "AppUsagePrefs"
+    const val KEY_TRACKING_ENABLED = "tracking_enabled"
+}
 
 class AppUsageTracker(private val context: Context) {
     private var lastTrackedApp: String? = null
@@ -39,8 +46,18 @@ class AppUsageTracker(private val context: Context) {
     private val minimumTimeThreshold = 1000
 
 
-    private val sessionStorage= LinkedList<AppSession>()
+//    private val sessionStorage= LinkedList<AppSession>()
     private val activeSessions = mutableMapOf<String, AppSession>()
+
+    private fun isSystemApp(packageName: String): Boolean {
+        val pm = context.packageManager
+        return try {
+            val appInfo = pm.getApplicationInfo(packageName, 0)
+            (appInfo.flags and ApplicationInfo.FLAG_SYSTEM) != 0
+        } catch (e: PackageManager.NameNotFoundException) {
+            false
+        }
+    }
 
     fun trackCurrentApp() {
         val usageStatsManager = context.getSystemService(Context.USAGE_STATS_SERVICE) as UsageStatsManager
@@ -53,11 +70,15 @@ class AppUsageTracker(private val context: Context) {
         while (events.hasNextEvent()) {
             events.getNextEvent(event)
 
-            if (event.eventType == UsageEvents.Event.MOVE_TO_FOREGROUND ||
-                event.eventType == UsageEvents.Event.MOVE_TO_BACKGROUND) {
+            if (event.eventType == UsageEvents.Event.ACTIVITY_RESUMED ||
+                event.eventType == UsageEvents.Event.ACTIVITY_PAUSED) {
 
                 val currentTime = event.timeStamp
                 val packageName = event.packageName
+
+                if(isSystemApp(packageName)){
+                    continue
+                }
 
 
                 if (packageName == lastTrackedApp &&
@@ -75,7 +96,7 @@ class AppUsageTracker(private val context: Context) {
 
                 val timeFormat = SimpleDateFormat("HH:mm:ss", Locale.getDefault())
                 when (event.eventType) {
-                    UsageEvents.Event.MOVE_TO_FOREGROUND -> {
+                    UsageEvents.Event.ACTIVITY_RESUMED -> {
 
                         activeSessions[packageName] = AppSession(
                             packageName = packageName,
@@ -84,11 +105,11 @@ class AppUsageTracker(private val context: Context) {
                         )
                         val timeOpen = timeFormat.format(Date(currentTime))
                         Log.i("AppUsageTracker",
-                            "App Name: $packageName | " +
+                            "App Name: $appName | " +
                                     "Open: $timeOpen | ")
                     }
 
-                    UsageEvents.Event.MOVE_TO_BACKGROUND -> {
+                    UsageEvents.Event.ACTIVITY_PAUSED -> {
 
                         activeSessions[packageName]?.let { session ->
                             session.endTime = currentTime
@@ -102,7 +123,7 @@ class AppUsageTracker(private val context: Context) {
                                         "close: $timeClose | " +
                                         "Duration: $durationSeconds seconds")
 
-                            sessionStorage.add(session)
+//                            sessionStorage.add(session)
                             activeSessions.remove(packageName)
                         }
                     }
@@ -116,32 +137,21 @@ class AppUsageTracker(private val context: Context) {
 }
 
 class MainActivity : ComponentActivity() {
-    private lateinit var appUsageTracker: AppUsageTracker
-    private val handler = Handler(Looper.getMainLooper())
-    private val trackingRunnable = object : Runnable {
-        override fun run() {
-            appUsageTracker.trackCurrentApp()
-            handler.postDelayed(this, 1000)
-        }
-    }
-
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
         if (!isUsageAccessGranted()) {
-
             val intent = Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS)
             startActivity(intent)
             Log.w("AppUsageTracker", "Please grant Usage Access for this app.")
-        } else {
-            appUsageTracker = AppUsageTracker(this)
-            startTracking()
         }
+
+        val savedTrackingState = getTrackingState()
 
         setContent {
             AppUsageTheme {
                 var isTrackingEnabled by remember {
-                    mutableStateOf(false)
+                    mutableStateOf(savedTrackingState)
                 }
                 Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
                     Row(
@@ -152,13 +162,20 @@ class MainActivity : ComponentActivity() {
                         verticalAlignment = Alignment.CenterVertically
                     ){
                         Greeting(
-                            name = "Collect Data",
+                            name = "Just tracking apps \uD83D\uDE44",
                         )
                         Toggle(
                             isChecked = isTrackingEnabled,
                             onCheckedChange={isChecked->
+
                                 isTrackingEnabled=isChecked
-                                if(isChecked) startTracking() else stopTracking()
+                                saveTrackingState(isChecked)
+
+                                if(isChecked) {
+                                    startTrackingService()
+                                } else {
+                                    stopTrackingService()
+                                }
                             }
 
                         )
@@ -180,25 +197,59 @@ class MainActivity : ComponentActivity() {
         return appList != null && appList.isNotEmpty()
     }
 
-    private fun startTracking() {
-        handler.post(trackingRunnable)
+    private fun isNotificationEnabled(context: Context): Boolean {
+        return NotificationManagerCompat.from(context).areNotificationsEnabled()
     }
 
-    private fun stopTracking(){
-        handler.removeCallbacks(trackingRunnable)
+    private fun requestNotificationPermission(context: Context) {
+        if (!isNotificationEnabled(context)) {
+            val intent = Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS)
+            intent.putExtra(Settings.EXTRA_APP_PACKAGE, context.packageName)
+            context.startActivity(intent)
+        }
     }
 
-    override fun onDestroy() {
-        super.onDestroy()
-        handler.removeCallbacks(trackingRunnable)
+    private fun saveTrackingState(isEnabled: Boolean) {
+        getSharedPreferences(PreferencesConstants.PREF_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean(PreferencesConstants.KEY_TRACKING_ENABLED, isEnabled)
+            .apply()
     }
+
+    private fun getTrackingState(): Boolean {
+        return getSharedPreferences(PreferencesConstants.PREF_NAME, Context.MODE_PRIVATE)
+            .getBoolean(PreferencesConstants.KEY_TRACKING_ENABLED, false)
+    }
+
+    private fun startTrackingService() {
+        if (!isNotificationEnabled(this)) {
+            requestNotificationPermission(this)
+        }
+        Intent(applicationContext, UsageTrackingService::class.java).also {
+            it.action=UsageTrackingService.Actions.START.toString()
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                startForegroundService(it)
+            } else {
+                startService(it)
+            }
+        }
+    }
+
+    private fun stopTrackingService() {
+        Intent(applicationContext, UsageTrackingService::class.java).also {
+            it.action=UsageTrackingService.Actions.STOP.toString()
+            startService(it)
+        }
+    }
+
+
 }
 
 @Composable
 fun Greeting(name: String) {
     Text(
-        text = "$name!",
-        modifier = Modifier.padding(start = 5.dp)
+        text = "$name",
+        modifier = Modifier.padding(start = 5.dp, top = 10.dp)
     )
 }
 
@@ -208,6 +259,6 @@ fun Toggle(isChecked: Boolean, onCheckedChange:(Boolean)->Unit){
     Switch(
         checked = isChecked,
         onCheckedChange = onCheckedChange,
-        modifier = Modifier.padding(end = 5.dp)
+        modifier = Modifier.padding(end = 5.dp, top = 10.dp)
         )
 }
