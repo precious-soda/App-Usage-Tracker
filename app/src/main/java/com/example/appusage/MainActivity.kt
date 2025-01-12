@@ -13,6 +13,7 @@ import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -30,10 +31,21 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.core.app.NotificationManagerCompat
 import com.example.appusage.ui.theme.AppUsageTheme
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import java.text.SimpleDateFormat
 import java.util.Date
-import java.util.LinkedList
+import androidx.compose.foundation.lazy.LazyColumn
 import java.util.Locale
+import androidx.compose.material3.*
+import androidx.room.*
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.lazy.items
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.livedata.observeAsState
+
 
 object PreferencesConstants {
     const val PREF_NAME = "AppUsagePrefs"
@@ -44,20 +56,17 @@ class AppUsageTracker(private val context: Context) {
     private var lastTrackedApp: String? = null
     private var lastTrackedTime: Long = 0
     private val minimumTimeThreshold = 1000
-
-
-//    private val sessionStorage= LinkedList<AppSession>()
     private val activeSessions = mutableMapOf<String, AppSession>()
+    private val scope = CoroutineScope(Dispatchers.IO)
 
-    private fun isSystemApp(packageName: String): Boolean {
-        val pm = context.packageManager
-        return try {
-            val appInfo = pm.getApplicationInfo(packageName, 0)
-            (appInfo.flags and ApplicationInfo.FLAG_SYSTEM) != 0
-        } catch (e: PackageManager.NameNotFoundException) {
-            false
-        }
-    }
+    private val db = Room.databaseBuilder(
+        context.applicationContext,
+        AppDatabase::class.java,
+        "app-usage-db"
+    ).build()
+
+    private val dao = db.appSessionDao()
+
 
     fun trackCurrentApp() {
         val usageStatsManager = context.getSystemService(Context.USAGE_STATS_SERVICE) as UsageStatsManager
@@ -73,65 +82,78 @@ class AppUsageTracker(private val context: Context) {
             if (event.eventType == UsageEvents.Event.ACTIVITY_RESUMED ||
                 event.eventType == UsageEvents.Event.ACTIVITY_PAUSED) {
 
-                val currentTime = event.timeStamp
-                val packageName = event.packageName
-
-                if(isSystemApp(packageName)){
-                    continue
-                }
-
-
-                if (packageName == lastTrackedApp &&
-                    currentTime - lastTrackedTime < minimumTimeThreshold) {
-                    continue
-                }
-
-
-                val appName = try {
-                    val pm = context.packageManager
-                    pm.getApplicationLabel(pm.getApplicationInfo(packageName, 0)).toString()
-                } catch (e: Exception) {
-                    packageName
-                }
-
-                val timeFormat = SimpleDateFormat("HH:mm:ss", Locale.getDefault())
-                when (event.eventType) {
-                    UsageEvents.Event.ACTIVITY_RESUMED -> {
-
-                        activeSessions[packageName] = AppSession(
-                            packageName = packageName,
-                            appName = appName,
-                            startTime = currentTime
-                        )
-                        val timeOpen = timeFormat.format(Date(currentTime))
-                        Log.i("AppUsageTracker",
-                            "App Name: $appName | " +
-                                    "Open: $timeOpen | ")
-                    }
-
-                    UsageEvents.Event.ACTIVITY_PAUSED -> {
-
-                        activeSessions[packageName]?.let { session ->
-                            session.endTime = currentTime
-                            session.duration = currentTime - session.startTime
-
-                            val timeClose = timeFormat.format(Date(currentTime))
-                            val durationSeconds = session.duration / 1000
-
-                            Log.i("AppUsageTracker",
-                                "App Name: ${session.appName} | " +
-                                        "close: $timeClose | " +
-                                        "Duration: $durationSeconds seconds")
-
-//                            sessionStorage.add(session)
-                            activeSessions.remove(packageName)
-                        }
-                    }
-                }
-
-                lastTrackedApp = packageName
-                lastTrackedTime = currentTime
+                handleAppEvent(event)
             }
+        }
+    }
+
+    private fun handleAppEvent(event: UsageEvents.Event) {
+        val currentTime = event.timeStamp
+        val packageName = event.packageName
+
+        if (isSystemApp(packageName)) return
+        if (packageName == lastTrackedApp &&
+            currentTime - lastTrackedTime < minimumTimeThreshold) return
+
+        val appName = getAppName(packageName)
+
+        when (event.eventType) {
+            UsageEvents.Event.ACTIVITY_RESUMED -> {
+                handleAppOpen(packageName, appName, currentTime)
+            }
+            UsageEvents.Event.ACTIVITY_PAUSED -> {
+                handleAppClose(packageName, currentTime)
+            }
+        }
+
+        lastTrackedApp = packageName
+        lastTrackedTime = currentTime
+    }
+
+    private fun handleAppOpen(packageName: String, appName: String, time: Long) {
+        activeSessions[packageName] = AppSession(
+            packageName = packageName,
+            appName = appName,
+            startTime = time
+        )
+    }
+
+    private fun handleAppClose(packageName: String, time: Long) {
+        activeSessions[packageName]?.let { session ->
+            session.endTime = time
+            session.duration = time - session.startTime
+
+            scope.launch {
+                dao.insert(session)
+            }
+            Log.d(
+                "AppUsageTracker",
+                "App Closed: ${session.appName}, Package: $packageName, " +
+                        "Duration: ${session.duration / 1000} seconds, " +
+                        "Start Time: ${SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date(session.startTime))}, " +
+                        "End Time: ${SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date(session.endTime))}"
+            )
+
+            activeSessions.remove(packageName)
+        }
+    }
+
+    private fun getAppName(packageName: String): String {
+        return try {
+            val pm = context.packageManager
+            pm.getApplicationLabel(pm.getApplicationInfo(packageName, 0)).toString()
+        } catch (e: Exception) {
+            packageName
+        }
+    }
+
+    private fun isSystemApp(packageName: String): Boolean {
+        val pm = context.packageManager
+        return try {
+            val appInfo = pm.getApplicationInfo(packageName, 0)
+            (appInfo.flags and ApplicationInfo.FLAG_SYSTEM) != 0
+        } catch (e: PackageManager.NameNotFoundException) {
+            false
         }
     }
 }
@@ -139,6 +161,14 @@ class AppUsageTracker(private val context: Context) {
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        val db by lazy {
+            Room.databaseBuilder(
+                applicationContext,
+                AppDatabase::class.java,
+                "app-usage-db"
+            ).build()
+        }
 
         if (!isUsageAccessGranted()) {
             val intent = Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS)
@@ -150,37 +180,51 @@ class MainActivity : ComponentActivity() {
 
         setContent {
             AppUsageTheme {
+                var sessions by remember { mutableStateOf<List<AppSession>>(emptyList()) }
                 var isTrackingEnabled by remember {
                     mutableStateOf(savedTrackingState)
                 }
+                LaunchedEffect(Unit) {
+                    launch(Dispatchers.IO) {
+                        db.appSessionDao().getRecentSessions().let{
+                            sessions = it
+                        }
+                    }
+                }
                 Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
-                    Row(
+                    Column(
                         modifier = Modifier
                             .padding(innerPadding)
-                            .fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ){
-                        Greeting(
-                            name = "Just tracking apps \uD83D\uDE44",
-                        )
-                        Toggle(
-                            isChecked = isTrackingEnabled,
-                            onCheckedChange={isChecked->
+                            .fillMaxSize()
+                    ) {
+                        Row(
+                            modifier = Modifier
+                                .padding(innerPadding)
+                                .fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Greeting(
+                                name = "Just tracking apps \uD83D\uDE44",
+                            )
+                            Toggle(
+                                isChecked = isTrackingEnabled,
+                                onCheckedChange = { isChecked ->
 
-                                isTrackingEnabled=isChecked
-                                saveTrackingState(isChecked)
+                                    isTrackingEnabled = isChecked
+                                    saveTrackingState(isChecked)
 
-                                if(isChecked) {
-                                    startTrackingService()
-                                } else {
-                                    stopTrackingService()
+                                    if (isChecked) {
+                                        startTrackingService()
+                                    } else {
+                                        stopTrackingService()
+                                    }
                                 }
-                            }
 
-                        )
+                            )
+                        }
+                        SessionList(sessions = sessions)
                     }
-
                 }
             }
         }
@@ -262,3 +306,36 @@ fun Toggle(isChecked: Boolean, onCheckedChange:(Boolean)->Unit){
         modifier = Modifier.padding(end = 5.dp, top = 10.dp)
         )
 }
+
+@Composable
+fun SessionList(sessions: List<AppSession>) {
+    LazyColumn {
+        items(sessions) { session ->
+            SessionCard(session = session)
+        }
+    }
+}
+
+@Composable
+fun SessionCard(session: AppSession) {
+    Card(
+        modifier = Modifier
+            .padding(8.dp)
+            .fillMaxWidth()
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp)
+        ) {
+            Text(
+                text = session.appName,
+                style = MaterialTheme.typography.titleLarge
+            )
+            Spacer(modifier = Modifier.height(8.dp))
+            Text("App: ${session.appName}")
+            Text("Duration: ${session.duration / 1000} seconds")
+            Text("Started: ${SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date(session.startTime))}")
+            Text("Ended: ${SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date(session.endTime))}")
+        }
+    }
+}
+
