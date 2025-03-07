@@ -37,14 +37,15 @@ import kotlinx.coroutines.launch
 import java.text.SimpleDateFormat
 import java.util.Date
 import androidx.compose.foundation.lazy.LazyColumn
-import java.util.Locale
 import androidx.compose.material3.*
 import androidx.room.*
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.lazy.items
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.livedata.observeAsState
+import com.google.firebase.auth.FirebaseAuth
+import kotlinx.coroutines.withContext
+import java.util.Locale
 
 
 object PreferencesConstants {
@@ -63,7 +64,8 @@ class AppUsageTracker(private val context: Context) {
         context.applicationContext,
         AppDatabase::class.java,
         "app-usage-db"
-    ).build()
+    ).addMigrations(AppDatabase.MIGRATION_1_2)
+        .build()
 
     private val dao = db.appSessionDao()
 
@@ -125,10 +127,11 @@ class AppUsageTracker(private val context: Context) {
 
             scope.launch {
                 dao.insert(session)
+                SyncWorker.syncNow(context)
             }
             Log.d(
                 "AppUsageTracker",
-                "App Closed: ${session.appName}, Package: $packageName, " +
+                "App Closed: ${session.appName}, " +
                         "Duration: ${session.duration / 1000} seconds, " +
                         "Start Time: ${SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date(session.startTime))}, " +
                         "End Time: ${SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date(session.endTime))}"
@@ -141,8 +144,9 @@ class AppUsageTracker(private val context: Context) {
     private fun getAppName(packageName: String): String {
         return try {
             val pm = context.packageManager
-            pm.getApplicationLabel(pm.getApplicationInfo(packageName, 0)).toString()
-        } catch (e: Exception) {
+            val appInfo = pm.getApplicationInfo(packageName, 0)
+            pm.getApplicationLabel(appInfo).toString()
+        } catch (e: PackageManager.NameNotFoundException) {
             packageName
         }
     }
@@ -156,19 +160,57 @@ class AppUsageTracker(private val context: Context) {
             false
         }
     }
+
+
 }
 
 class MainActivity : ComponentActivity() {
+
+    val db by lazy {
+        Room.databaseBuilder(
+            applicationContext,
+            AppDatabase::class.java,
+            "app-usage-db"
+        ).addMigrations(AppDatabase.MIGRATION_1_2)
+            .build()
+    }
+
+    private fun setupSync() {
+        val currentUser = FirebaseAuth.getInstance().currentUser
+        if (currentUser != null) {
+            CoroutineScope(Dispatchers.IO).launch {
+                val unsyncedCount = db.appSessionDao().getUnsyncedSessions().size
+                if (unsyncedCount > 0) {
+                    withContext(Dispatchers.Main) {
+                        SyncWorker.schedulePeriodicSync(applicationContext)
+                    }
+                    Log.d("MainActivity", "Sync scheduled - found $unsyncedCount unsynced sessions")
+                } else {
+                    Log.d("MainActivity", "No unsynced data found - sync not scheduled")
+                }
+            }
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        val db by lazy {
-            Room.databaseBuilder(
-                applicationContext,
-                AppDatabase::class.java,
-                "app-usage-db"
-            ).build()
+        val currentUser = FirebaseAuth.getInstance().currentUser
+        if (currentUser == null) {
+            val intent = Intent(this, LoginActivity::class.java)
+            startActivity(intent)
+            finish()
+            return
         }
+
+//        CoroutineScope(Dispatchers.IO).launch {
+//            db.clearAllTables()
+//            resetAutoIncrement(db)
+//            Log.d("AppUsageTracker", "Database cleared!")
+//        }
+
+//        setupSync()
+
 
         if (!isUsageAccessGranted()) {
             val intent = Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS)
@@ -231,6 +273,11 @@ class MainActivity : ComponentActivity() {
     }
 
 
+    private suspend fun resetAutoIncrement(db: AppDatabase) {
+        val dao = db.appSessionDao()
+        dao.resetAutoIncrement()
+    }
+
     private fun isUsageAccessGranted(): Boolean {
         val usageStatsManager = getSystemService(Context.USAGE_STATS_SERVICE) as UsageStatsManager
         val appList = usageStatsManager.queryUsageStats(
@@ -287,6 +334,7 @@ class MainActivity : ComponentActivity() {
     }
 
 
+
 }
 
 @Composable
@@ -331,7 +379,6 @@ fun SessionCard(session: AppSession) {
                 style = MaterialTheme.typography.titleLarge
             )
             Spacer(modifier = Modifier.height(8.dp))
-            Text("App: ${session.appName}")
             Text("Duration: ${session.duration / 1000} seconds")
             Text("Started: ${SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date(session.startTime))}")
             Text("Ended: ${SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date(session.endTime))}")
